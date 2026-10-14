@@ -68,7 +68,7 @@ If you find this code useful, please cite our paper:
 ```bibtex
 @article{ye2027cigre,
   title   = {Camera-Incremental Person Re-Identification via Geometric Representation Evolution},
-  author  = {Ye, Mang and Zhang, Shipeng and Shi, Wuxuan and Lu, Zhijie and Li, He and Gao, Xingyu},
+  author  = {Mang,Ye and Shipeng,Zhang and Wuxuan,Shi and Zhijie,Lu and He,Li and Xingyu,Gao},
   journal = {IEEE Transactions on Pattern Analysis and Machine Intelligence},
   year    = {2027}
 }
