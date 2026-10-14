@@ -1,0 +1,334 @@
+import copy
+
+import torch.nn as nn
+import torchvision.models as models
+
+import torchvision
+import torch
+import math
+import numpy as np
+import torch.nn.functional as F
+from torch.autograd import Variable
+from torch.distributions.multivariate_normal import MultivariateNormal
+from torch.distributions import Normal, Independent
+
+class ETF_Classifier(nn.Module):
+    """
+    基于 Simplex ETF 的分类头
+    - feature_dim: 输入特征的维度
+    - num_classes: 分类的类别数
+    - LWS: 是否使用 LWS 技术Learned Weight Scaling--每个类的尺度可学习
+    - reg_ETF: 预留是否对 ETF 做正则
+    该分类器使用 ETF 权重矩阵进行分类，权重矩阵在初始化时被设置为不可训练参数。
+    通过前向传播计算输入特征与 ETF 权重矩阵的点积，得到分类得分。
+    """
+    def __init__(self, feature_dim, num_classes,LWS=False, reg_ETF=False,device=None):
+        super(ETF_Classifier, self).__init__()
+        self.feature_dim = feature_dim
+        self.num_classes = num_classes
+        self.LWS = LWS
+        self.reg_ETF = reg_ETF
+
+        # 生成随机正交矩阵 P (d x C)
+        P = self.generate_random_orthogonal_matrix(feature_dim, num_classes)
+        I = torch.eye(num_classes)
+        one = torch.ones((num_classes, num_classes))
+
+        # 构造 ETF 矩阵 M = sqrt(C/(C-1)) * P @ (I - 1/C * 11^T)
+        M = math.sqrt(num_classes / (num_classes - 1.0)) * torch.matmul (P,(I - one / num_classes)) 
+        # 把 M 注册为 buffer（随 module 一起移动到 device，但不参与优化）
+        self.register_buffer('ori_M', M)  # shape: (d, C)
+        if self.LWS:
+            # learned scaling per-class (初始化为接近 1 的小随机量)
+            # 我们用 alpha 经过 softmax 再乘 C 得到每个类的 scale
+            self.alpha = nn.Parameter(1e-3 * torch.randn(1,num_classes))
+        else:
+            # 非 LWS 使用固定的 ones（注册为 buffer 以便移动设备）
+            self.register_buffer('fixed_scale', torch.ones(1, num_classes))
+    
+
+    def generate_random_orthogonal_matrix(self, feature_dim, num_classes):
+        # 生成随机正交矩阵
+        a = np.random.randn(feature_dim, num_classes).astype(np.float32)
+        P, _ = np.linalg.qr(a) 
+        P = torch.from_numpy(P).float()
+        if hasattr(self, 'ori_M') and self.ori_M is not None:
+            P = P.to(self.ori_M.device)
+        return P
+
+    # # 全局ETF
+    # def expand_etf(self, old_M, feature_dim, num_new_classes):
+    #     """
+    #     old_M: [feature_dim, old_num_classes]
+    #     """
+    #     old_num_classes = old_M.size(1)
+    #     num_classes_total = old_num_classes + num_new_classes
+    #     device = old_M.device
+
+    #     # 生成随机新列
+    #     new_M_random = torch.from_numpy(np.random.randn(feature_dim, num_new_classes).astype(np.float32)).to(device)
+
+    #     # Step 2. 正交化新列 w.r.t 旧列
+    #     proj = old_M @ (old_M.t() @ new_M_random)
+    #     new_M = new_M_random - proj
+
+    #     # Step 3. 再对新列自身做 QR 正交化，增强稳定性
+    #     new_M, _ = torch.linalg.qr(new_M, mode='reduced')
+
+    #     # 对每一列归一化
+    #     new_M = F.normalize(new_M, p=2, dim=0)
+
+
+    #     # 拼接新列和旧列
+    #     expanded_M = torch.cat([old_M,new_M], dim=1)
+    #     expanded_M = F.normalize(expanded_M, p=2, dim=0)
+
+    #     return expanded_M
+
+    # 局部ETF
+    def expand_etf(self, old_M, feature_dim, num_new_classes): 
+        """ old_M: [feature_dim, old_num_classes] """ 
+
+        old_num_classes = old_M.size(1) 
+        num_classes_total = old_num_classes + num_new_classes 
+        device = old_M.device 
+
+        # 生成随机新列 
+        new_M_random = torch.from_numpy(np.random.randn(feature_dim, num_new_classes).astype(np.float32)).to(device) 
+
+        # 正交化新列，与旧列正交 
+        P_old = old_M @ old_M.T 
+        new_M = new_M_random - P_old @ new_M_random 
+
+        # 对每一列归一化 
+        new_M = torch.nn.functional.normalize(new_M, p=2, dim=0) 
+
+        # ETF缩放 
+        I_new = torch.eye(num_new_classes, device=device) 
+        one_new = torch.ones((num_new_classes, num_new_classes),device=device) 
+        new_M = math.sqrt(num_classes_total / (num_classes_total - 1.0)) * new_M @ (I_new - one_new / num_new_classes)
+
+        # 拼接新列和旧列 
+        expanded_M = torch.cat([old_M,new_M], dim=1) 
+        expanded_M = F.normalize(expanded_M, p=2, dim=0) 
+        return expanded_M 
+
+
+
+    def forward(self, x):
+        """
+        输入:
+            x: features, shape (N, d)
+        输出:
+            logits: shape (N, C)
+        说明:
+            - 对输入做 L2 归一化（保证在单位球面）
+            - 计算 logits = x @ M （如果 LWS 则对 M 的列按类尺度缩放）
+        """
+        # 确保 x 是二维 (N, d)
+        assert x.dim() == 2 and x.size(1) == self.feature_dim, f"Expected input (N,{self.feature_dim}), got {tuple(x.shape)}"
+
+        # L2 归一化输入特征（避免外部没有归一化）
+        x_norm = F.normalize(x, p=2, dim=1, eps=1e-8)  # (N, d)
+
+        M = self.ori_M  # (d, C)
+
+        # 应用 LWS 缩放（如果选用）
+        if self.LWS:
+            # softmax alpha -> scale in (0, C) 类似之前注释掉的策略
+            scale = F.softmax(self.alpha, dim=-1) * self.num_classes  # (1, C)
+            logits = torch.matmul(x_norm, M * scale)  # broadcasting (d,C)*(1,C) -> (d,C)
+        else:
+            scale = 30.0
+            logits = torch.matmul(x_norm, M) * scale # (N, C)
+            # print("logits mean/std:", logits.mean().item(), logits.std().item())
+
+        return logits
+
+
+
+
+class GeneralizedMeanPooling(nn.Module):
+    r"""应用2D幂平均自适应池化到由多个输入平面组成的输入信号上。
+    计算函数为： :math:`f(X) = pow(sum(pow(X, p)), 1/p)`
+        - 当 p = 无穷大时，得到最大池化
+        - 当 p = 1 时，得到平均池化
+    输出的大小为 H x W，适用于任何输入大小。
+    输出特征的数量等于输入平面的数量。
+    参数:
+        output_size: 目标输出大小，形状为 H x W。
+                     可以是元组 (H, W) 或单个 H 表示方形图像 H x H
+                     H 和 W 可以是 ``int`` 类型，或者 ``None``，表示大小与输入相同。
+    """
+
+    def __init__(self, norm, output_size=1, eps=1e-6):
+        super(GeneralizedMeanPooling, self).__init__()
+        assert norm > 0
+        self.p = float(norm)  # 幂参数
+        self.output_size = output_size  # 输出大小
+        self.eps = eps  # 避免数值计算中的零值
+
+    def forward(self, x):
+        x = x.clamp(min=self.eps).pow(self.p)  # 避免零值并计算幂
+        return torch.nn.functional.adaptive_avg_pool2d(x, self.output_size).pow(1. / self.p)  # 自适应池化并计算幂的倒数
+
+    def __repr__(self):
+        return self.__class__.__name__ + '(' \
+            + str(self.p) + ', ' \
+            + 'output_size=' + str(self.output_size) + ')'
+
+
+class GeneralizedMeanPoolingP(GeneralizedMeanPooling):
+    def __init__(self, norm=3, output_size=1, eps=1e-6):
+        super(GeneralizedMeanPoolingP, self).__init__(norm, output_size, eps)
+
+
+class Normalize(nn.Module):
+    def __init__(self, power=2, dim=1):
+        super(Normalize, self).__init__()
+        self.power = power  # 正则化的幂
+        self.dim = dim  # 规范化的维度
+
+    def forward(self, x):
+        norm = x.pow(self.power).sum(self.dim, keepdim=True).pow(1. / self.power)  # 计算范数
+        out = x.div(norm + 1e-4)  # 进行规范化
+        return out
+
+
+class ResNetSimCLR(nn.Module):
+    def __init__(self, base_model='resnet50', out_dim=2048, n_sampling=2, pool_len=8, normal_feature=True,
+                 num_classes=-1, uncertainty=True):
+        super(ResNetSimCLR, self).__init__()
+
+        # 定义不同的 ResNet 模型
+        self.resnet_dict = {"resnet18": models.resnet18(pretrained=False, num_classes=out_dim),
+                            "resnet50": models.resnet50(pretrained=True)}
+        self.resnet = self._get_basemodel(base_model)  # 获取基础模型
+        self.base = nn.Sequential(*list(self.resnet.children())[:-3])  # 去掉最后几层
+        dim_mlp = self.resnet.fc.in_features // 2  # 计算全连接层的输入维度
+        self.linear_mean = nn.Linear(dim_mlp, out_dim)  # 用于计算均值的线性层
+        self.linear_var = nn.Linear(dim_mlp, out_dim)  # 用于计算方差的线性层
+        self.pool_len = 8  # 池化层的长度
+        self.conv_var = nn.Conv2d(dim_mlp, dim_mlp, kernel_size=(pool_len, pool_len), bias=False)  # 用于计算方差的卷积层
+
+        self.n_sampling = n_sampling  # 采样次数
+        self.n_samples = torch.Size(np.array([n_sampling, ]))  # 采样尺寸
+        self.pooling_layer = GeneralizedMeanPoolingP(3)  # 定义池化层
+
+        self.l2norm_mean, self.l2norm_var, self.l2norm_sample = Normalize(2, 1), Normalize(2, 1), Normalize(2, 2)  # 归一化层
+
+        print('using resnet50 as a backbone')  # 打印使用的模型
+        '''xkl add'''
+        print("##########normalize matchiing feature:", normal_feature)  # 打印是否匹配特征
+        self.normal_feature = normal_feature  # 是否规范化特征
+        self.uncertainty = uncertainty  # 是否使用不确定性
+
+        self.bottleneck = nn.BatchNorm2d(out_dim)  # 批量归一化层
+        self.bottleneck.bias.requires_grad_(False)  # 不需要训练偏置
+        nn.init.constant_(self.bottleneck.weight, 1)  # 初始化权重为1
+        nn.init.constant_(self.bottleneck.bias, 0)  # 初始化偏置为0
+
+        # ETF classifier 
+        self.classifier = ETF_Classifier(out_dim, num_classes, LWS=False, reg_ETF=False) 
+        self.relu = nn.ReLU()  # 激活函数
+
+    def _get_basemodel(self, model_name):
+        model = self.resnet_dict[model_name]  # 根据名称获取模型
+        return model
+
+    def forward(self, x, training_phase=None, fkd=False):
+        BS = x.size(0)  # 获取批量大小
+        out = self.base(x)  # 通过基础网络层 (去除ResNet最后几层的主干网络)
+        
+        # 计算均值特征路径
+        out_mean = self.pooling_layer(out)  # 对 'out' 进行全局池化 (GeneralizedMeanPoolingP)
+        out_mean = out_mean.view(out_mean.size(0), -1)  # 将池化后的特征展平，形状变为 (BS, D_pooled)
+        out_mean = self.linear_mean(out_mean)  # 通过线性层得到初步的均值特征 (BS, out_dim)
+
+        # 计算方差特征路径 (这里的方差更像是用于生成不确定性的特征，而不是直接的统计方差)
+        out_var_feat = self.conv_var(out)  # 对 'out' 使用特定的卷积层 (self.conv_var)
+        out_var_feat = self.pooling_layer(out_var_feat)  # 对卷积后的特征进行全局池化
+        out_var_feat += 1e-4  # 添加一个小的epsilon，防止数值问题
+        out_var_feat = out_var_feat.view(out_var_feat.size(0), -1)  # 将池化后的方差特征展平
+        out_var_feat = self.linear_var(out_var_feat)  # 通过线性层得到初步的方差相关特征
+
+        # 对均值特征进行L2归一化，得到最终的 s_features (通常用于ReID匹配的特征)
+        s_features = self.l2norm_mean(out_mean)  # (BS, out_dim)，L2范数为1
+
+        # 对初步的方差特征进行处理，得到最终的 out_var (用于多变量正态分布的scale_tril对角线)
+        var_choice = 'L2'  # 方差处理方式选择
+        if var_choice == 'L2':
+            out_var = self.l2norm_var(out_var_feat)  # 对初步方差特征进行L2归一化
+            out_var = self.relu(out_var) + 1e-4    # 通过ReLU激活并加epsilon (确保为正，作为标准差或方差的代理)
+        elif var_choice == 'softmax':
+            out_var = F.softmax(out_var_feat, dim=1) # 使用softmax处理
+            out_var = out_var.clone()                 # 克隆以避免潜在的inplace修改问题
+        elif var_choice == 'log':
+            out_var = torch.exp(0.5 * out_var_feat)   # 假设 out_var_feat 是 log(variance)，得到标准差
+
+        # 初始化最终返回的合并特征、分类输出和最后一层特征
+        final_merge_feat = None
+        final_cls_outputs = None
+        final_feat_final_layer = out  # 'out' 是 self.base 的输出，即池化前的深层特征图
+
+        if self.uncertainty:  # 如果启用不确定性估计
+            BS_current, D = s_features.size()  # 获取当前批次大小和特征维度
+            # 创建多变量正态分布，均值为s_features，协方差矩阵的对角线为out_var (解释为每个维度的方差或标准差的平方)
+            # torch.diag_embed(out_var) 创建一个对角矩阵，对角线元素是 out_var 的值
+            tdist = MultivariateNormal(loc=s_features, scale_tril=torch.diag_embed(out_var))
+            # std = torch.sqrt(F.softplus(out_var) + 1e-8)
+            # tdist = Independent(Normal(loc=s_features, scale=std), 1)
+            samples = tdist.rsample(self.n_samples)  # 从分布中进行可重参数化采样，形状 (n_samples, BS_current, D)
+            samples = F.normalize(samples, p=2, dim=-1, eps=1e-8)  # 对采样的特征进行L2归一化，在第2维上 (特征维度)
+
+            # 将归一化的均值特征 (s_features) 与归一化的采样特征 (samples) 合并
+            # s_features.unsqueeze(0) 形状 (1, BS_current, D)
+            # current_merge_feat 形状 (n_samples + 1, BS_current, D)
+            current_merge_feat = torch.cat((s_features.unsqueeze(0), samples), dim=0)
+            # 将合并后的特征展平，以便通过后续层
+            # 形状 ((n_samples + 1) * BS_current, D)
+            current_merge_feat_flat = current_merge_feat.reshape(current_merge_feat.size(0) * current_merge_feat.size(1), current_merge_feat.size(-1))
+
+            # 通过瓶颈层 (BatchNorm2d，所以需要 unsqueeze 添加通道和空间维度)
+            # bn_feat 形状 ((n_samples + 1) * BS_current, D, 1, 1)
+            bn_feat = self.bottleneck(current_merge_feat_flat.unsqueeze(-1).unsqueeze(-1))
+            # 对瓶颈层输出进行分类
+            # bn_feat[..., 0, 0] 形状 ((n_samples + 1) * BS_current, D)
+            # current_cls_outputs_flat 形状 ((n_samples + 1) * BS_current, num_classes)
+            current_cls_outputs_flat = self.classifier(bn_feat[..., 0, 0])
+
+            # 将合并特征和分类输出的形状调整回 (BS_current, n_samples + 1, FeatureDim/NumClasses) 以匹配 Trainer 中的期望
+            # permute(1,0,2) 将 (n_samples + 1, BS_current, Dim) 变为 (BS_current, n_samples + 1, Dim)
+            final_merge_feat = current_merge_feat_flat.reshape(self.n_sampling + 1, BS_current, current_merge_feat_flat.size(-1)).permute(1,0,2)
+            final_cls_outputs = current_cls_outputs_flat.reshape(self.n_sampling + 1, BS_current, current_cls_outputs_flat.size(-1)).permute(1,0,2)
+        else:  # 如果不启用不确定性估计
+            # 对归一化的均值特征 (s_features) 进行瓶颈处理和分类
+            bn_feat = self.bottleneck(s_features.unsqueeze(-1).unsqueeze(-1)) # (BS, D, 1, 1)
+            current_cls_outputs = self.classifier(bn_feat[..., 0, 0]) # (BS, num_classes)
+
+            # 为了与不确定性情况下的输出形状保持一致（主要是为了下游如Trainer的统一处理）
+            # 将分类输出和均值特征在第1维（采样维）上复制 n_sampling + 1 次
+            # final_cls_outputs 形状 (BS, n_sampling + 1, num_classes)
+            final_cls_outputs = current_cls_outputs.unsqueeze(1).repeat(1, self.n_sampling + 1, 1)
+            # final_merge_feat 形状 (BS, n_sampling + 1, D)
+            final_merge_feat = s_features.unsqueeze(1).repeat(1, self.n_sampling + 1, 1)
+
+
+        # 根据 fkd (feature knowledge distillation) 标志决定返回值
+        # 如果 fkd 为 True，通常用于知识蒸馏，返回所有5个值
+        if fkd:
+             return s_features, final_merge_feat, final_cls_outputs, out_var, final_feat_final_layer
+
+        # 无论是在训练模式还是评估模式 (当 fkd 不为 True 时)，
+        # 都返回标准的5个输出，以确保 `extract_features_uncertain` 和 `Trainer.train` 能获取所需的值。
+        # `s_features` 是L2归一化的均值特征。
+        # `final_merge_feat` 是合并后的特征，形状 (BS, n_sampling+1, D)。
+        # `final_cls_outputs` 是分类输出，形状 (BS, n_sampling+1, num_classes)。
+        # `out_var` 是处理后的方差相关特征。
+        # `final_feat_final_layer` 是 `self.base` 的输出（池化前的特征图）。
+        return s_features, final_merge_feat, final_cls_outputs, out_var, final_feat_final_layer
+
+
+if __name__ == '__main__':
+    m = ResNetSimCLR(uncertainty=True)  # 实例化模型，并启用不确定性估计
+    m(torch.zeros(10, 3, 256, 128))  # 使用一个形状为 (10, 3, 256, 128) 的全零张量进行前向传播测试
