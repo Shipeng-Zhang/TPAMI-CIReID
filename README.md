@@ -66,11 +66,11 @@ The following results were obtained on an NVIDIA 4060 GPU:
 If you find this code useful, please cite our paper:
 
 ```bibtex
-@article{ye2025cigre,
+@article{ye2027cigre,
   title   = {Camera-Incremental Person Re-Identification via Geometric Representation Evolution},
   author  = {Ye, Mang and Zhang, Shipeng and Shi, Wuxuan and Lu, Zhijie and Li, He and Gao, Xingyu},
   journal = {IEEE Transactions on Pattern Analysis and Machine Intelligence},
-  year    = {2025}
+  year    = {2027}
 }
 ```
 
