@@ -7,9 +7,10 @@ Re-Identification via Geometric Representation Evolution**.
 
 ## Task Setting
 
-The model receives one camera at a time and cannot access historical images.
-The default Market-1501 order is `cam0 -> cam1 -> cam2 -> cam4 -> cam5`, with
-`cam3` held out for evaluation. 
+Unlike conventional lifelong ReID,
+the identity spaces across stages may overlap: a new camera can observe both
+previously seen identities from new viewpoints and previously unseen
+identities. The primary benchmark follows supervised ReID.  The model receives one camera at a time and cannot access historical images. The default Market-1501 order is `cam0 -> cam1 -> cam2 -> cam4 -> cam5`, with `cam3` held out for evaluation.
 
 ## Installation
 
@@ -31,11 +32,13 @@ and [MSMT17](http://www.pkuvmc.com/dataset.html), then arrange them as follows:
 │   └── Market-1501-v15.09.15/
 │       ├── bounding_box_train/
 │       ├── bounding_box_test/
-│       └── query/
+│       ├── query/
+│       └── ...
 └── MSMT17_V2/
     ├── bounding_box_train/
     ├── bounding_box_test/
-    └── query/
+    ├── query/
+    └── .../
 ```
 
 ## Quick start
